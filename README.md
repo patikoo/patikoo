@@ -1,1 +1,1 @@
-dont readme
+discord @puripur
