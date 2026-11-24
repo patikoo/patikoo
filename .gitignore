@@ -1,0 +1,7 @@
+# Vending Scout: never commit secrets or caches
+*.env
+__pycache__/
+*.db-journal
+# Tracker data holds your location and research; kept local unless you choose to commit it
+/Vending Scout/*
+!/Vending Scout/README.md
