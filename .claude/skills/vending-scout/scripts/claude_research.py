@@ -1,8 +1,7 @@
 """Claude does the research and writing (official `anthropic` Python SDK).
 
-Two steps per site: (1) research with Anthropic's server-side web search / web fetch tools,
-(2) convert the findings into a fixed JSON schema with structured outputs (no tools).
-Server-side refusal fallbacks are enabled (`fallbacks="default"`).
+Each task = (1) research with server-side web search / web fetch, then (2) structured-output
+extraction into a fixed JSON schema. Server-side refusal fallbacks are on (`fallbacks="default"`).
 """
 from __future__ import annotations
 
@@ -18,61 +17,72 @@ DOCS = {
     "pricing": "https://platform.claude.com/docs/en/about-claude/pricing",
 }
 PRICE = {"claude-opus-5-5": (4.0, 20.0), "claude-sonnet-5-5": (2.0, 10.0), "claude-haiku-5-5": (0.10, 0.50)}
-WEB_SEARCH_USD = 0.01           # $10 per 1,000 searches
-EST_SITE_USD = 0.60             # pre-call guard estimate for one site's research + extraction
+WEB_SEARCH_USD = 0.01
+EST = {"research": 0.60, "hours": 0.40, "contact": 0.25, "draft": 0.05}  # pre-call budget guards
 BETAS = ["server-side-fallback-2026-07-01"]
-TOOLS = [
-    {"type": "web_search_20260209", "name": "web_search", "max_uses": 6,
-     "user_location": {"type": "approximate", "country": "NL"}},
-    {"type": "web_fetch_20260209", "name": "web_fetch", "max_uses": 6},
-]
 
-RESEARCH_SYSTEM = """You research workplaces as possible vending machine locations for a small local operator.
+
+def tools(country: str):
+    return [{"type": "web_search_20260209", "name": "web_search", "max_uses": 8,
+             "user_location": {"type": "approximate", "country": country}},
+            {"type": "web_fetch_20260209", "name": "web_fetch", "max_uses": 10}]
+
+
+S = lambda t: {"type": t}
+N = lambda t: {"type": [t, "null"]}
+
+
+def obj(props: dict) -> dict:
+    return {"type": "object", "additionalProperties": False, "required": list(props), "properties": props}
+
+
+RESEARCH_SYSTEM = """You verify workplaces and collect their public job ads for a small local vending operator.
 Rules:
-- Business name and address must come from the business's OWN website (give the exact page URL). Do not copy them from Google Maps.
-- Only report job ads you actually opened, with their URL. Quote at most 300 characters of the ad that describe the role and hours.
-- If an ad lists several schedules (for example a day rota and a night rota), list each one separately.
-- Night headcount: report a number only if a source states it (give the URL and quote). Never estimate.
-- Cafeteria / existing vending: report only what a source says; otherwise say unknown.
-- Say plainly when something could not be found."""
+- Identity: business name and street address must be shown on the employer's OWN website. Give that page URL.
+  If you cannot find them there, set verified=false and say why. Never copy them from map listings.
+- Job ads: open the employer's ORIGINAL ad (careers page or the agency ad that names this employer). Record its URL.
+  Mark ads that say filled, closed, or past their closing date as stale.
+- An ad belongs to THIS building only if it names this address/location or a site detail that matches it.
+  A matching employer name or city alone is not enough: then site_match = ambiguous and say why.
+- Shift times and days: copy only what the ad states explicitly (24h HH:MM, days as Mon..Sun). Never infer
+  times from words like "nachtdienst". List every distinct schedule separately.
+- Excerpt: at most 300 characters quoted from the ad, about the role and hours.
+- If a source cannot be opened, list it under sources_failed with the reason. Never invent a result."""
 
-EXTRACT_SCHEMA = {
-    "type": "object",
-    "additionalProperties": False,
-    "required": ["business", "jobs", "headcount", "cafeteria", "vending_contract", "contact"],
-    "properties": {
-        "business": {"type": "object", "additionalProperties": False,
-                     "required": ["name", "address", "source_url", "note"],
-                     "properties": {"name": {"type": ["string", "null"]}, "address": {"type": ["string", "null"]},
-                                    "source_url": {"type": ["string", "null"]}, "note": {"type": "string"}}},
-        "jobs": {"type": "array", "items": {
-            "type": "object", "additionalProperties": False,
-            "required": ["source_url", "ad_status", "excerpt", "schedules", "note"],
-            "properties": {
-                "source_url": {"type": "string"},
-                "ad_status": {"type": "string", "enum": ["active", "expired", "unknown"]},
-                "excerpt": {"type": "string"},
-                "schedules": {"type": "array", "items": {
-                    "type": "object", "additionalProperties": False, "required": ["start", "end", "days", "note"],
-                    "properties": {"start": {"type": ["string", "null"], "description": "HH:MM 24h"},
-                                   "end": {"type": ["string", "null"], "description": "HH:MM 24h"},
-                                   "days": {"type": ["string", "null"], "description": "Comma list of Mon,Tue,Wed,Thu,Fri,Sat,Sun"},
-                                   "note": {"type": "string"}}}},
-                "note": {"type": "string"}}}},
-        "headcount": {"type": "object", "additionalProperties": False, "required": ["night_count", "source", "note"],
-                      "properties": {"night_count": {"type": ["integer", "null"]}, "source": {"type": ["string", "null"]},
-                                     "note": {"type": "string"}}},
-        "cafeteria": {"type": "string", "enum": ["yes", "no", "unknown"]},
-        "vending_contract": {"type": "string", "enum": ["yes", "no", "unknown"]},
-        "contact": {"type": "object", "additionalProperties": False, "required": ["recipient", "source", "note"],
-                    "properties": {"recipient": {"type": ["string", "null"]}, "source": {"type": ["string", "null"]},
-                                   "note": {"type": "string"}}},
-    },
-}
+RESEARCH_SCHEMA = obj({
+    "business": obj({"name": N("string"), "address": N("string"), "source_url": N("string"),
+                     "verified": S("boolean"), "note": S("string")}),
+    "jobs": {"type": "array", "items": obj({
+        "original_ad_url": S("string"),
+        "ad_status": {"type": "string", "enum": ["active", "stale"]},
+        "site_match": {"type": "string", "enum": ["confirmed", "ambiguous"]},
+        "match_evidence": S("string"),
+        "excerpt": S("string"),
+        "schedules": {"type": "array", "items": obj({"start": N("string"), "end": N("string"), "days": N("string"),
+                                                      "source_quote": S("string")})},
+        "note": S("string")})},
+    "sources_failed": {"type": "array", "items": obj({"url": S("string"), "reason": S("string")})},
+})
+
+HOURS_SYSTEM = """You verify opening hours of food and convenience venues from BUSINESS-OWNED sources only
+(the venue's own website or its chain's official store page). Map listings and directories do not count.
+For each venue return the hours exactly as published, in local time. Use always_open for 24/7. Include any
+published holiday hours by ISO date. If no business-owned source states the hours, set verified=false."""
+
+HOURS_SCHEMA = obj({"venues": {"type": "array", "items": obj({
+    "key": S("string"), "verified": S("boolean"), "source_url": N("string"), "always_open": S("boolean"),
+    "weekly": {"type": "array", "items": obj({"day": {"type": "string", "enum": ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]},
+                                               "open": S("string"), "close": S("string")})},
+    "holidays": {"type": "array", "items": obj({"date": S("string"), "closed": S("boolean"),
+                                                 "open": N("string"), "close": N("string")})},
+    "holidays_same_as_regular": S("boolean"),
+    "note": S("string")})}})
+
+CONTACT_SCHEMA = obj({"recipient": N("string"), "contact_source": N("string"), "contact_page": N("string"), "note": S("string")})
+DRAFT_SCHEMA = obj({"subject": S("string"), "body": S("string")})
 
 
 def make_client(api_key: str) -> anthropic.Anthropic:
-    # Pin the public endpoint so a stray ANTHROPIC_BASE_URL never redirects the user's key.
     return anthropic.Anthropic(api_key=api_key, base_url="https://api.anthropic.com")
 
 
@@ -94,55 +104,62 @@ def _check(msg) -> None:
     if msg.stop_reason == "refusal":
         raise RuntimeError(f"Claude declined: {getattr(msg, 'stop_details', None)}")
     if msg.stop_reason == "max_tokens":
-        raise RuntimeError("Claude hit max_tokens; rerun this site.")
+        raise RuntimeError("Claude hit max_tokens")
 
 
-def research_site(client, model: str, hint: dict) -> tuple[dict, float]:
-    """`hint` is live, unstored context: {'website': ..., 'label': ..., 'town': ...}. Returns (data, usd)."""
-    spent = 0.0
-    messages = [{"role": "user", "content":
-                 f"Workplace to research (from a live map lookup, not to be copied): {json.dumps(hint)}\n"
-                 "Find: official name and address on its own website; current job ads for this location "
-                 "(company careers page, werk.nl, indeed.nl, agencies) with shift times; any stated number of night-shift "
-                 "staff; whether there is a staff canteen and whether a vending operator already serves the site; "
-                 "a published general or facilities contact."}]
-    while True:
-        with client.beta.messages.stream(model=model, max_tokens=32000, system=RESEARCH_SYSTEM, messages=messages,
-                                         tools=TOOLS, thinking={"type": "adaptive"}, betas=BETAS,
-                                         fallbacks="default") as s:
-            msg = s.get_final_message()
-        spent += cost_usd(model, msg.usage)
-        if msg.stop_reason == "pause_turn":
-            messages.append({"role": "assistant", "content": msg.content})
-            continue
+class Claude:
+    def __init__(self, api_key: str, model: str, country: str = "NL"):
+        self.c, self.model, self.country = make_client(api_key), model, country
+
+    def _research(self, system: str, prompt: str) -> tuple[str, float]:
+        spent, messages = 0.0, [{"role": "user", "content": prompt}]
+        while True:
+            with self.c.beta.messages.stream(model=self.model, max_tokens=32000, system=system, messages=messages,
+                                             tools=tools(self.country), thinking={"type": "adaptive"},
+                                             betas=BETAS, fallbacks="default") as s:
+                msg = s.get_final_message()
+            spent += cost_usd(self.model, msg.usage)
+            if msg.stop_reason == "pause_turn":
+                messages.append({"role": "assistant", "content": msg.content})
+                continue
+            _check(msg)
+            return _text(msg), spent
+
+    def _extract(self, schema: dict, text: str) -> tuple[dict, float]:
+        msg = self.c.beta.messages.create(
+            model=self.model, max_tokens=16000, betas=BETAS, fallbacks="default",
+            output_config={"format": {"type": "json_schema", "schema": schema}},
+            messages=[{"role": "user", "content": "Convert these findings to the schema exactly. Use null where the findings "
+                       "do not state a value, and explain in the note.\n\n" + text}])
         _check(msg)
-        break
-    findings = _text(msg)
-    ext = client.beta.messages.create(
-        model=model, max_tokens=16000, betas=BETAS, fallbacks="default",
-        output_config={"format": {"type": "json_schema", "schema": EXTRACT_SCHEMA}},
-        messages=[{"role": "user", "content": "Convert these research findings to the schema. Use null where the "
-                   "findings do not state a value and explain why in the note.\n\n" + findings}])
-    spent += cost_usd(model, ext.usage)
-    _check(ext)
-    return json.loads(_text(ext)), spent
+        return json.loads(_text(msg)), cost_usd(self.model, msg.usage)
 
+    def research_site(self, hint: dict) -> tuple[dict, float]:
+        t, a = self._research(RESEARCH_SYSTEM, "Workplace (live map hint, do not copy): " + json.dumps(hint) +
+                              "\nVerify its identity on its own website, then collect its current public job ads.")
+        d, b = self._extract(RESEARCH_SCHEMA, t)
+        return d, a + b
 
-def draft_outreach(client, model: str, site: dict, summary: str, language: str = "nl") -> tuple[dict, float]:
-    schema = {"type": "object", "additionalProperties": False, "required": ["subject", "body"],
-              "properties": {"subject": {"type": "string"}, "body": {"type": "string"}}}
-    msg = client.beta.messages.create(
-        model=model, max_tokens=4000, betas=BETAS, fallbacks="default",
-        output_config={"format": {"type": "json_schema", "schema": schema}},
-        messages=[{"role": "user", "content":
-                   f"Write a short, polite first email (language: {language}) from a local vending operator to {site['name']} "
-                   f"offering to place a vending machine for night-shift staff at no cost to them. Facts you may use: {summary}. "
-                   "No invented numbers or claims. Under 150 words. Leave [Your name] and [phone] placeholders."}])
-    _check(msg)
-    return json.loads(_text(msg)), cost_usd(model, msg.usage)
+    def verify_hours(self, venues: list[dict]) -> tuple[dict, float]:
+        t, a = self._research(HOURS_SYSTEM, "Venues (live map hints with keys): " + json.dumps(venues))
+        d, b = self._extract(HOURS_SCHEMA, t)
+        return d, a + b
 
+    def find_contact(self, site: dict) -> tuple[dict, float]:
+        t, a = self._research("Find a PUBLIC facilities, site-services or general contact email for this specific site, "
+                              "published by the employer. Give the page URL. If there is no email, give the contact page URL. "
+                              "Never guess an address.", json.dumps(site))
+        d, b = self._extract(CONTACT_SCHEMA, t)
+        return d, a + b
 
-def ping(client, model: str) -> tuple[str, float]:
-    msg = client.messages.create(model=model, max_tokens=64, output_config={"effort": "low"},
-                                 messages=[{"role": "user", "content": "Reply with the single word: ready"}])
-    return _text(msg).strip(), cost_usd(model, msg.usage)
+    def draft_email(self, prompt: str) -> tuple[dict, float]:
+        msg = self.c.beta.messages.create(model=self.model, max_tokens=4000, betas=BETAS, fallbacks="default",
+                                          output_config={"format": {"type": "json_schema", "schema": DRAFT_SCHEMA}},
+                                          messages=[{"role": "user", "content": prompt}])
+        _check(msg)
+        return json.loads(_text(msg)), cost_usd(self.model, msg.usage)
+
+    def ping(self) -> tuple[str, float]:
+        msg = self.c.messages.create(model=self.model, max_tokens=64, output_config={"effort": "low"},
+                                     messages=[{"role": "user", "content": "Reply with the single word: ready"}])
+        return _text(msg).strip(), cost_usd(self.model, msg.usage)

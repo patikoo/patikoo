@@ -23,18 +23,20 @@ SECRET_KEYS = ("ANTHROPIC_API_KEY", "GOOGLE_MAPS_API_KEY", "TYPESAFE_API_KEY")
 
 DEFAULT_CONFIG = {
     "center_query": None,          # town or address the user gave
-    "center_lat": None,            # Places lat/lng may be cached max 30 days (Maps terms)
-    "center_lng": None,
-    "center_fetched_at": None,
+    "center": None,                # {place_id, lat, lng, query, resolved_at}; lat/lng re-resolved after 30 days
     "radius_value": 20,
     "radius_unit": "mi",           # "mi" or "km"; default 20 miles
     "timezone": None,              # IANA name of the user's local zone
+    "country": "NL",               # holiday calendar + web search locale
+    "language": "nl",              # outreach language
     "budget_usd": None,            # spending cap per run; the run stops before passing it
+    "batch_size": 10,              # new sites added per run
     "claude_model": "claude-opus-5-5",
-    "food_radius_m": 1000,         # walking distance from a site to count a food venue
+    "food_radius_m": 800,
     "site_queries": [
-        "distributiecentrum", "logistiek centrum", "ziekenhuis", "fabriek",
-        "productiebedrijf", "verpleeghuis", "datacenter", "pakketsorteercentrum",
+        "warehouse", "distributiecentrum", "logistiek centrum", "pakketsorteercentrum", "fabriek",
+        "productiebedrijf", "voedselproductie", "ziekenhuis", "verpleeghuis", "zorginstelling",
+        "datacenter", "drukkerij", "slachterij", "bakkerij productie",
     ],
 }
 

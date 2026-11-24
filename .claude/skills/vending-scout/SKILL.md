@@ -1,72 +1,86 @@
 ---
 name: vending-scout
 description: >
-  Research vending machine locations (workplaces with night shifts and no food open at night) within
-  a set distance of the user's town or address. Uses Google Maps/Places to find sites, Claude to
-  research and write, and TypeSafe Jev to label job ads, then scores each shift and writes a linked
-  site report with Google Maps links into the "Vending Scout" tracker folder. Use when the user asks
-  to find, update or report vending locations or leads.
+  Research vending machine locations (workplaces with overnight shifts and no food open during them)
+  within a set distance of the user's town or address. Uses Google Places to find sites and food,
+  Claude to research and write, and TypeSafe Jev to label job ads; scores each shift, drafts outreach,
+  and keeps everything in the linked "Vending Scout" tracker with a Google Maps-linked site report.
+  Use when the user asks to find, update, score, contact or report vending locations or leads, or
+  gives visit answers or outreach activity for a site.
 ---
 
 # Vending Scout
 
-Everything runs through `scripts/scout.py` (Python 3.10+, run from the folder that holds `Vending Scout/`).
-Install the official SDKs once: `pip install anthropic typesafe-sdk`.
+All commands: `python3 .claude/skills/vending-scout/scripts/scout.py <command>`, run from the folder that holds
+`Vending Scout/`. Install the official SDKs once: `pip install anthropic typesafe-sdk`.
 
 ## 1. Ask only for what is missing
 
-Run `python3 .claude/skills/vending-scout/scripts/scout.py access`. Ask the user **only** for the items it lists:
+Run `access`. Ask the user only for what it lists:
+- **Location**: the town or address to center on. **Distance**: default **20 miles**; keep km if the user gives km.
+- **Spending limit** (USD per run). If unsure, suggest $10 (`references/costs.md`) and ask them to confirm.
+- **Missing access**: `ANTHROPIC_API_KEY`, `GOOGLE_MAPS_API_KEY`, `TYPESAFE_API_KEY` go in `~/.config/vending-scout/secrets.env`
+  (mode 600). Never ask for keys in chat, print them, or write them to the tracker, reports, manifests or git.
 
-- **Location**: the town or address to center on. **Distance**: how far to search. If the user gives none, use **20 miles**.
-  If they give km, keep km (`--unit km`).
-- **Spending limit** in USD per run. If the user doesn't know, suggest $10 (see `references/costs.md`) and ask them to confirm.
-- **Missing access**: API keys (`ANTHROPIC_API_KEY`, `GOOGLE_MAPS_API_KEY`, `TYPESAFE_API_KEY`). Tell the user to put them in
-  the secrets file the script names (`~/.config/vending-scout/secrets.env`, mode 600). Never ask them to paste a key into chat,
-  never print a key, and never write one into the tracker, a report, a manifest or git.
+Use the user's local IANA time zone for every date and time.
+`init --center "<town or address>" --radius 20 --unit mi --timezone <Area/City> --budget <usd>`
 
-Time zone: use the user's local IANA zone (set once with `--timezone`; all timestamps are written in it).
+## 2. Check, then stop if anything is missing
 
-```
-python3 .claude/skills/vending-scout/scripts/scout.py init --center "<town or address>" --radius 20 --unit mi --timezone <Area/City> --budget <usd>
-```
+`check` makes one Places lookup, one Jev request and one Claude call and records **live**, **docs-only** (no key or host
+blocked; request built from official docs) or **mock** beside each in `integration_checks` and the run manifest.
+`verify` runs the synthetic examples, a full mock pipeline and the join checks. **Report missing access to the user and stop**
+before `run` if any integration is not live. `where` shows where everything is saved.
 
-## 2. Check integrations before any real run
+## 3. Run a batch: `run --batch 10`
 
-`scout.py check` makes one Places lookup, one Jev request and one Claude call, and records each as **live**, **docs-only**
-(no key or host blocked; the request is built from the official docs) or **mock** (offline fixture) in
-`integration_checks` and in `Vending Scout/manifests/run-NNN.json`. If anything is missing, **report the missing access to
-the user and stop**. Do not start `run` with any check in docs-only mode.
+Steps own their fields and never overwrite each other's. Each run is recorded in `run_manifest` + `manifests/run-NNN.json`
+with the exact center (query, place_id, lat/lng, resolve time) and search coverage. The run stops before the spending limit.
 
-## 3. Run
+1. **discover** (owns sites.place_id, distance_m): Places Text Search per `config.json → site_queries` (warehouses, plants,
+   hospitals, care homes, parcel/data centres…), restricted to the circle's bounding box, all pages (≤3), dedup by place_id,
+   keep only straight-line distance ≤ radius. Adds up to `batch` new sites as `found`. Discovery is not a census.
+2. **research** (owns site identity, job source fields, shifts): Claude verifies name + address on the employer's **own
+   website**, opens the **original** ad, marks filled/expired ads `stale`, and copies shift times/days only as stated. Each
+   distinct schedule gets a permanent `shift_id`. Employer name or city alone does not join an ad to a building →
+   `site_match = ambiguous` (review). A failed source gets one `unavailable` job entry, never an invented result.
+   Every job must link to an existing site before the site becomes `researched`; unverified identity → `review`.
+3. **label** (owns arrangement, work_type, shift, confidence, review_reason, distributions): Jev answers three independent
+   Choice questions over each excerpt (`scripts/jev.py`). `unknown` → review even at high confidence; uncertain labels and
+   conflicts (stale ad, ambiguous match, label vs source times) → review. Labels never change shift times. Unchanged
+   excerpts reuse labels. Verify N/N excerpts are labelled or have a recorded failure.
+4. **food** (owns food, food_searches, results): for verified sites with an active, site-matched ad whose source times span
+   midnight with explicit days. Nearby Search ≤ 800 m; a 20-result response is narrowed (per type, then quarter circles) and
+   deduped, else flagged incomplete. Google results are used live; hours are stored only from business-owned sources.
+5. **score** (owns results): dead hours = shift duration − union of open-food intervals, on real local dates (midnight, DST,
+   Dutch holidays, 24-hour venues; `scripts/timecalc.py`). Unknown hours or incomplete coverage → unknown, never 0.
+   Unknown walking access → `provisional`. Score = verified_night_headcount × dead_hours (worker-hours per shift), only from
+   independently verified headcount in `checks`; otherwise blank with `missing_checks`. Ranks research priority, not earnings.
+6. **outreach** (owns outreach, status `draft_ready`): scored sites first, then the unscored verification queue. Public
+   facilities contact + source (blank recipient → contact page in notes). One email per site, under 90 words, asking whether
+   the overnight team already has food available; cites a shift only if current and site-matched; no sales or revenue
+   claims. Saved, never sent.
+7. `checklist` writes `Vending Scout/visit-checklist.md`; `report` writes `report/sites.html` + `tables/*.csv`; `queue` prints
+   counts for every site, the review queue, scored vs needs-verification, and drafts.
 
-`scout.py run --max-sites 15` does, in order, stopping before the spending limit is passed:
+Show the user: counts for all sites in the batch (including unresolved), the review queue, scored sites separately from
+those needing verification, draft count with sources, and status changes (`status_log`).
 
-1. Center point from Places Text Search (lat/lng cached at most 30 days).
-2. Candidate workplaces: Text Search per query in `config.json → site_queries`, filtered to the radius. **Only place IDs are stored.**
-3. Per site: live Place Details (not stored) gives Claude a hint; Claude (web search + web fetch) reads the business's **own
-   website** for name/address (`sites.source_url`), finds job ads, shift times, a sourced night headcount, canteen and vending facts.
-   `match_status` compares website name with the live Maps name.
-4. Each job ad is labelled by Jev (`scripts/jev.py`, official `typesafe-sdk`): arrangement, work_type, shift, confidence,
-   review_reason. Thresholds and decisions are in code; all question wording is in `QUESTIONS`.
-5. Each distinct schedule becomes its own `shift_id` (an ad with day and night rotas gives two shifts).
-6. Food venues within `food_radius_m` come from Nearby Search; their Google hours are used live for scoring and **not stored**.
-7. `checks` and `results` are keyed by `(site_id, job_id, shift_id)`. Score = night headcount × dead hours × cafeteria factor ×
-   vending factor (`scripts/scoring.py`). No verified headcount → no score (`needs_headcount`).
-8. Claude drafts outreach for scored sites with a published contact. Drafts are never sent.
+## 4. When the user reports back
 
-Then `scout.py report` writes `Vending Scout/report/sites.html` (linked: site → job → shift, Google Maps links) and CSVs in
-`Vending Scout/tables/`. `scout.py verify` re-checks the joins. `scout.py where` prints every location.
+- Visit/phone answers → `answer --site S --shift SH --headcount N --source "who, when"` (+ `--cafeteria`, `--vending`,
+  `--access-notes`); walking access → `food-access --food F --status accessible|not_accessible`. Both rescore.
+- Activity → `status --site S --to contacted|visited|closed --confirm "what they did"`. Only from the user's confirmed
+  activity. Closed sites are skipped and never reopened automatically; contacted/visited/closed survive reruns.
 
 ## Data rules
 
-- Permanent IDs (`site-001`, `job-001`, `shift-001`, `food-001`, `out-001`, `run-001`, `chk-001`) come from `id_counters` and are never reused.
-- Unknown values stay blank; the reason goes in that row's `notes`. Never estimate headcounts.
-- Google Maps: store place IDs only; fetch other details live; show Google Maps attribution; see `references/google-places.md`.
-- Every table has `notes`. Schema: `scripts/schema.sql`.
+Permanent IDs (`site-001`, `job-001`, `shift-001`, `food-001`, `out-001`, `run-001`, `chk-001`) are never reused. Reruns keep
+IDs and user-entered checks. Unknown values stay blank with the reason in `notes`. Every table has `notes`. Google Maps:
+store place IDs only, fetch details live, link with Google Maps attribution (`references/google-places.md`).
+Status ladder: found → researched → draft_ready → contacted → visited → closed, with `review` as a hold.
 
 ## References
 
-- `references/google-places.md` — endpoints, field masks, storage and attribution rules, sources.
-- `references/typesafe-jev.md` — SDK usage, questions, decision rules; the official skill is in `.claude/skills/typesafe-ai/`.
-- `references/claude.md` — model, tools, structured outputs, fallbacks.
-- `references/costs.md` — what a run costs and how to pick a spending limit.
+`references/google-places.md` · `references/typesafe-jev.md` (official skill in `.claude/skills/typesafe-ai/`) ·
+`references/claude.md` · `references/costs.md` · schema: `scripts/schema.sql`

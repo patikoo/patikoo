@@ -1,102 +1,92 @@
-"""Label job ads with TypeSafe Jev via the official `typesafe-sdk` (System One API).
+"""Label job excerpts with TypeSafe Jev via the official `typesafe-sdk` (System One API).
 
-Follows the official TypeSafe skill (.claude/skills/typesafe-ai/SKILL.md):
-- Jev makes small judgments; the decision logic (thresholds, review flags) lives in code below.
-- All question wording is kept in QUESTIONS, in one place.
-- Each Choice is paired with a Noul for the null case.
-- A failed API call is an error, never treated as an answer.
-- 0.7 / 0.3 are the starting Noul thresholds; the band between means "needs review".
+Three independent Choice questions over the same text (one request, shared state):
+  arrangement = onsite | remote | hybrid | unknown
+  work_type   = physical | desk | mixed | unknown
+  shift       = day | evening | overnight | rotating | unknown
+Definitions: overnight = work spanning midnight; evening = late work ending before midnight;
+rotating = explicitly changing shifts. Missing or contradictory evidence = unknown.
+
+Following the official TypeSafe skill: wording lives only in QUESTIONS; Jev judges, code decides;
+a failed call is recorded as a failure, never as an answer; option names describe content.
 """
 from __future__ import annotations
 
-from typesafe_sdk import Choice, Noul, TypeSafeClient
+import hashlib
+import json
 
-DOCS = {
-    "sdk": "https://docs.typesafe.ai/go/python-sdk",
-    "api": "https://docs.typesafe.ai/go/api",
-    "openapi": "https://api.typesafe.ai/openapi.json",
-    "skill": "https://github.com/typesafe-ai/skills",
-}
-YES, NO = 0.7, 0.3
-CHOICE_MIN = 0.6
+from typesafe_sdk import Choice, TypeSafeClient
+
+DOCS = {"sdk": "https://docs.typesafe.ai/go/python-sdk", "api": "https://docs.typesafe.ai/go/api",
+        "choice": "https://docs.typesafe.ai/go/choice", "skill": "https://github.com/typesafe-ai/skills"}
+QUESTIONS_VERSION = "v2"
+MIN_TOP = 0.6      # top option probability below this -> review
+MIN_MARGIN = 0.15  # top minus runner-up below this -> review
 
 QUESTIONS = {
-    "is_job_ad": Noul(
-        instructions="Is `ad.text` an advertisement for a job opening?",
-        criteria={"true": "The text offers a position that people can apply for.",
-                  "false": "The text is a news item, company profile, or a page that lists no position."},
-    ),
-    "mentions_schedule": Noul(
-        instructions="Does `ad.text` state working hours or a shift pattern for the position?",
-        criteria={"true": "It names times, shifts (such as night shift or ploegendienst), or the days worked.",
-                  "false": "It gives no hours or shift information."},
-    ),
-    "night_work": Noul(
-        instructions="Does `ad.text` say the position includes work between 22:00 and 06:00?",
-        criteria={"true": "Night shifts, a rota that includes nights, or hours that run past 22:00 or start before 06:00.",
-                  "false": "The hours stated are all between 06:00 and 22:00."},
-    ),
     "arrangement": Choice(
-        instructions="Where does the person in `ad.text` do the work?",
-        criteria={"on_site": "At the company's location, every working day.",
+        instructions="Where does the person in the job described in `job.text` do the work?",
+        criteria={"onsite": "At the employer's location on every working day.",
+                  "remote": "From home or anywhere, never at the location.",
                   "hybrid": "Partly at the location and partly from home.",
-                  "remote": "From home or anywhere, not at the location."},
-    ),
+                  "unknown": "The text does not say where the work is done, or says contradictory things."}),
     "work_type": Choice(
-        instructions="What kind of contract does `ad.text` offer?",
-        criteria={"full_time": "A permanent or fixed-term job of about 32 hours a week or more.",
-                  "part_time": "A job of fewer than about 32 hours a week.",
-                  "temporary_or_agency": "Work through an employment agency (uitzendbureau) or a short temporary placement.",
-                  "internship": "An internship or traineeship (stage).",
-                  "freelance": "Self-employed or freelance work (zzp)."},
-    ),
+        instructions="What kind of work is the job described in `job.text`?",
+        criteria={"physical": "Mostly hands-on work on the floor, such as picking, production, cleaning, care or driving.",
+                  "desk": "Mostly computer or office work at a desk.",
+                  "mixed": "A real share of both hands-on work and desk work.",
+                  "unknown": "The text does not describe the tasks, or describes contradictory ones."}),
     "shift": Choice(
-        instructions="Which shift pattern does `ad.text` describe?",
-        criteria={"fixed_day": "Always daytime hours.",
-                  "fixed_evening": "Always evening hours.",
-                  "fixed_night": "Always night hours.",
-                  "rotating": "A rota that moves between day, evening, and/or night shifts (such as 2- or 3-ploegendienst).",
-                  "unspecified": "The ad does not describe the pattern."},
-    ),
+        instructions="When does the job described in `job.text` take place?",
+        criteria={"day": "Daytime hours only.",
+                  "evening": "Late work that ends before midnight.",
+                  "overnight": "Work that spans midnight, such as a fixed night shift.",
+                  "rotating": "Shifts that explicitly change, such as a 2- or 3-ploegendienst or a rota of day and night shifts.",
+                  "unknown": "The text gives no working hours, or contradictory ones."}),
 }
 
 
-def build_state(excerpt: str, site_name: str | None, url: str | None) -> dict:
-    return {"ad": {"text": excerpt, "employer": site_name or "", "url": url or ""}}
+def input_hash(excerpt: str) -> str:
+    qs = {k: q.model_dump(exclude_none=True) for k, q in QUESTIONS.items()}
+    return hashlib.sha256(json.dumps([QUESTIONS_VERSION, excerpt, qs], sort_keys=True).encode()).hexdigest()[:16]
 
 
-def decide(resp) -> dict:
-    """Map Jev answers to tracker fields. Pure code — testable without the API."""
-    n = {k: v.noul for k, v in resp.nouls.items()}
-    c = resp.choices
-    reasons = []
-    for k in ("is_job_ad", "night_work", "mentions_schedule"):
-        if NO < n[k] < YES:
-            reasons.append(f"{k} unsettled ({n[k]:.2f})")
-    if n["is_job_ad"] <= NO:
-        reasons.append("probably not a job ad")
-    shift = c["shift"].choice if n["mentions_schedule"] >= YES else "unspecified"
-    for k in ("arrangement", "work_type") + (("shift",) if shift != "unspecified" else ()):
-        top = max(c[k].probabilities.values())
-        if top < CHOICE_MIN:
-            reasons.append(f"{k} top probability {top:.2f}")
-    # Confidence = weakest settled judgment used for this row.
-    used = [max(n["is_job_ad"], 1 - n["is_job_ad"]), max(n["night_work"], 1 - n["night_work"]),
-            max(c["arrangement"].probabilities.values()), max(c["work_type"].probabilities.values())]
-    return {
-        "ad_status_hint": "not_job_ad" if n["is_job_ad"] <= NO else None,
-        "arrangement": c["arrangement"].choice,
-        "work_type": c["work_type"].choice,
-        "shift": shift,
-        "night_work": n["night_work"],
-        "confidence": round(min(used), 3),
-        "review_reason": "; ".join(reasons) or None,
-    }
+def state_for(excerpt: str) -> dict:
+    return {"job": {"text": excerpt}}  # Jev labels the job described; no employer metadata in state
 
 
-def label_ad(api_key: str, excerpt: str, site_name: str | None, url: str | None):
-    """Returns (decision dict, raw response, exact payload). Raises on any API failure."""
-    state = build_state(excerpt, site_name, url)
+def decide(resp, job: dict, shift_rows: list[dict], crosses_midnight) -> dict:
+    """Pure decision code: chosen values, distributions, confidence, review_reason."""
+    out, dist, reasons, tops = {}, {}, [], []
+    for q in QUESTIONS:
+        a = resp.choices[q]
+        probs = dict(a.probabilities)
+        ranked = sorted(probs.values(), reverse=True)
+        top, margin = ranked[0], ranked[0] - (ranked[1] if len(ranked) > 1 else 0)
+        out[q], dist[q] = a.choice, {k: round(v, 4) for k, v in probs.items()}
+        tops.append(top)
+        if a.choice == "unknown":
+            reasons.append(f"{q}=unknown")
+        elif top < MIN_TOP or margin < MIN_MARGIN:
+            reasons.append(f"{q} uncertain (top {top:.2f}, margin {margin:.2f})")
+    # conflicting metadata
+    timed = [s for s in shift_rows if s.get("start") and s.get("end")]
+    spans = [crosses_midnight(s["start"], s["end"]) for s in timed]
+    if out["shift"] == "overnight" and timed and not any(spans):
+        reasons.append("label overnight but source times do not span midnight")
+    if any(spans) and out["shift"] in ("day", "evening"):
+        reasons.append(f"source times span midnight but label is {out['shift']}")
+    if out["arrangement"] == "remote" and out["work_type"] == "physical":
+        reasons.append("remote + physical conflict")
+    if job.get("site_match") == "ambiguous":
+        reasons.append("ad-to-site match ambiguous")
+    if job.get("ad_status") == "stale":
+        reasons.append("ad is stale")
+    return {**out, "confidence": round(min(tops), 4), "label_distributions": json.dumps(dist),
+            "review_reason": "; ".join(reasons) or None}
+
+
+def ask(api_key: str, excerpt: str):
+    """One System One request. Raises on any failure (caller records it)."""
     with TypeSafeClient(api_key=api_key) as client:
-        resp = client.system_one(state=state, questions=QUESTIONS)
-    return decide(resp), resp, {"state": state, "questions": {k: q.model_dump(exclude_none=True) for k, q in QUESTIONS.items()}}
+        return client.system_one(state=state_for(excerpt), questions=QUESTIONS)
