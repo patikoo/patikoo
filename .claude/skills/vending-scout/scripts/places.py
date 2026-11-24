@@ -133,6 +133,10 @@ def maps_url(place_id: str, label: str = "") -> str:
     return f"https://www.google.com/maps/search/?{q}"
 
 
+def maps_search_url(text: str) -> str:
+    return "https://www.google.com/maps/search/?" + urllib.parse.urlencode({"api": 1, "query": text})
+
+
 def distance_m(lat1: float, lng1: float, lat2: float, lng2: float) -> int:
     r = 6371000.0
     p1, p2 = math.radians(lat1), math.radians(lat2)

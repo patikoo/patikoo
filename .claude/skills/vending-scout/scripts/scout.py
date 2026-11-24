@@ -351,13 +351,14 @@ def write_report(con, path, mock=False):
     Q = queues(con)
     best = {r[0]: r[1] for r in con.execute("SELECT site_id, MAX(score) FROM results GROUP BY site_id")}
     sites = sorted(con.execute("SELECT * FROM sites").fetchall(), key=lambda s: (-(best.get(s["site_id"]) or -1), s["site_id"]))
-    maps = lambda pid, lab="": f'<a href="{_e(places.maps_url(pid, lab))}" target=_blank rel=noopener>Google Maps</a>' if pid else ""
+    maps = lambda pid, lab="": (f'<a href="{_e(places.maps_url(pid, lab) if pid else places.maps_search_url(lab))}" target=_blank rel=noopener>Google Maps</a>'
+                                if (pid or lab) else "")
     T = lambda head, rows: "<table><tr>" + "".join(f"<th>{h}</th>" for h in head) + "</tr>" + "".join(
         "<tr>" + "".join(f"<td>{c}</td>" for c in r) + "</tr>" for r in rows) + "</table>"
     a = lambda i: f'<a href="#{i}">{i}</a>'
     parts = [T(["site", "name", "status", "distance", "best score", "map"],
                [[a(s["site_id"]), _e(s["name"]) or "<i>unverified</i>", s["status"], f'{_e(s["distance_m"])} m',
-                 _e(best.get(s["site_id"])), maps(s["place_id"], s["name"] or "")] for s in sites])]
+                 _e(best.get(s["site_id"])), maps(s["place_id"], " ".join(x for x in (s["name"], s["address"]) if x))] for s in sites])]
     parts.append("<h2>Scored shifts</h2><p class=note>Score = verified night headcount × dead hours (worker-hours per shift). "
                  "Ranks research priority, not earnings.</p>" +
                  T(["site", "shift", "dead h", "score", "status"], [[a(r["site_id"]), a(r["shift_id"]), r["dead_hours"], r["score"], r["score_status"]]
@@ -371,7 +372,7 @@ def write_report(con, path, mock=False):
         sid = s["site_id"]
         src = f'<a href="{_e(s["source_url"])}">employer website</a>' if s["source_url"] else "identity not verified"
         p = [f'<section id="{sid}"><h2>{sid} · {_e(s["name"]) or "<i>name unverified</i>"} <small>[{s["status"]}]</small></h2>'
-             f'<p>{_e(s["address"])} — {src} · {maps(s["place_id"], s["name"] or "")}</p><p class=note>{_e(s["notes"])}</p>']
+             f'<p>{_e(s["address"])} — {src} · {maps(s["place_id"], " ".join(x for x in (s["name"], s["address"]) if x))}</p><p class=note>{_e(s["notes"])}</p>']
         jobs = con.execute("SELECT * FROM jobs WHERE site_id=? ORDER BY job_id", (sid,)).fetchall()
         lab = {}
         for j in jobs:
@@ -433,6 +434,71 @@ def cmd_report(a=None):
 
 def cmd_checklist(a):
     print(write_checklist(vc.connect(), vc.load_config(), vc.TRACKER / "visit-checklist.md"))
+
+
+# ================================================================ manual import
+def cmd_import(a):
+    """Add sites/jobs/shifts found by hand or by Claude in chat (no paid APIs).
+    JSON: {"evidence": "...", "sites": [{"key", "name", "address", "source_url", "status": "found|review",
+           "town", "approx_distance_km", "notes", "jobs": [{"source_url", "ad_status", "site_match", "excerpt",
+           "notes", "suggested_labels", "schedules": [{"start","end","days","source_quote"}]}]}]}
+    Re-importing the same key updates the row and keeps its IDs."""
+    cfg, con = vc.load_config(), vc.connect()
+    vc.init_db(con)
+    data = json.loads(Path(a.file).read_text())
+    rid = start_run(con, cfg, "manual-import", {"places": "docs-only", "jev": "docs-only", "claude": "docs-only"},
+                    data.get("evidence"))
+    for s in data["sites"]:
+        key = f"manual:{s['key']}"
+        row = con.execute("SELECT site_id, status FROM sites WHERE place_id=?", (key,)).fetchone()
+        note = " | ".join(x for x in [s.get("notes"), f"approx. {s['approx_distance_km']} km from {cfg['center_query']} (town centres; exact distance needs geocoding)"
+                                      if s.get("approx_distance_km") is not None else None, "entered manually: no Google place_id"] if x)
+        if row:
+            sid = row[0]
+            con.execute("UPDATE sites SET name=?, address=?, source_url=?, notes=? WHERE site_id=?",
+                        (s.get("name"), s.get("address"), s.get("source_url"), note, sid))
+            if row[1] in ("found", "review") and s.get("status") and s["status"] != row[1]:
+                steps.set_status(con, cfg, sid, s["status"], "research", "manual import")
+        else:
+            sid = vc.new_id(con, "site")
+            con.execute("INSERT INTO sites(site_id, place_id, name, address, source_url, match_status, status, found_by, notes) "
+                        "VALUES (?,?,?,?,?,?,?,?,?)", (sid, key, s.get("name"), s.get("address"), s.get("source_url"), "unverified",
+                                                      s.get("status", "found"), "manual", note))
+            con.execute("INSERT INTO status_log VALUES (?,?,?,?,?,?,NULL)", (sid, vc.now_iso(cfg), None, s.get("status", "found"), "research", "manual import"))
+        for j in s.get("jobs", []):
+            ex = con.execute("SELECT job_id FROM jobs WHERE site_id=? AND source_url=?", (sid, j["source_url"])).fetchone()
+            jn = " | ".join(x for x in [j.get("notes"), ("labels suggested by Claude in chat (not Jev): " + json.dumps(j["suggested_labels"]))
+                                        if j.get("suggested_labels") else None] if x)
+            sch = j.get("schedules", [])
+            one = sch[0] if len(sch) == 1 else {}
+            vals = (vc.now_iso(cfg), j.get("ad_status"), j.get("site_match"), j.get("excerpt"), one.get("start"), one.get("end"), one.get("days"), jn)
+            if ex:
+                jid = ex[0]
+                con.execute("UPDATE jobs SET checked_at=?, ad_status=?, site_match=?, excerpt=?, shift_start=?, shift_end=?, shift_days=?, notes=? "
+                            "WHERE job_id=?", (*vals, jid))
+            else:
+                jid = vc.new_id(con, "job")
+                con.execute("INSERT INTO jobs(job_id, site_id, source_url, checked_at, ad_status, site_match, excerpt, shift_start, shift_end, "
+                            "shift_days, notes) VALUES (?,?,?,?,?,?,?,?,?,?,?)", (jid, sid, j["source_url"], *vals))
+            if j.get("excerpt"):
+                con.execute("UPDATE jobs SET label_error=?, review_reason=? WHERE job_id=? AND arrangement IS NULL",
+                            ("Jev not run: no TYPESAFE_API_KEY (labels blank on purpose)", "awaiting Jev labels", jid))
+            for sc in sch:
+                k = (sc.get("start"), sc.get("end"), sc.get("days"))
+                e2 = con.execute('SELECT shift_id FROM shifts WHERE job_id=? AND start IS ? AND "end" IS ? AND days IS ?', (jid, *k)).fetchone()
+                if e2:
+                    shid = e2[0]
+                else:
+                    shid = vc.new_id(con, "shift")
+                    miss = [n for n, v in zip(("start", "end", "days"), k) if not v]
+                    con.execute("INSERT INTO shifts VALUES (?,?,?,?,?,?,?,?)", (shid, jid, sid, *k, sc.get("source_quote"),
+                                f"source does not state {', '.join(miss)}" if miss else None))
+                con.execute("INSERT OR IGNORE INTO checks(site_id, job_id, shift_id, entered_by, notes) VALUES (?,?,?,'auto',?)",
+                            (sid, jid, shid, "awaiting independent verification (visit or employer confirmation)"))
+    con.commit()
+    print(steps.score(con, cfg))
+    finish_run(con, cfg, rid, 0.0)
+    print_queue(con)
 
 
 # ================================================================ verification
@@ -581,6 +647,7 @@ def main():
     for n in ("access", "check", "verify", "report", "where", "queue", "checklist", "research", "label", "food", "score", "outreach"):
         sp.add_parser(n)
     p = sp.add_parser("run"); p.add_argument("--batch", type=int)
+    p = sp.add_parser("import"); p.add_argument("file")
     p = sp.add_parser("answer")
     p.add_argument("--site", required=True); p.add_argument("--shift"); p.add_argument("--headcount", type=int); p.add_argument("--source")
     p.add_argument("--cafeteria", choices=["yes", "no", "unknown"]); p.add_argument("--vending", choices=["yes", "no", "unknown"])
@@ -593,7 +660,7 @@ def main():
     {"init": cmd_init, "access": cmd_access, "check": cmd_check, "run": cmd_run, "verify": cmd_verify, "report": cmd_report,
      "where": cmd_where, "queue": lambda a: print_queue(vc.connect()), "checklist": cmd_checklist,
      "research": _single("research"), "label": _single("label"), "food": _single("food"), "score": _single("score"),
-     "outreach": _single("outreach"), "answer": cmd_answer, "food-access": cmd_food_access, "status": cmd_status}[a.cmd](a)
+     "outreach": _single("outreach"), "answer": cmd_answer, "food-access": cmd_food_access, "status": cmd_status, "import": cmd_import}[a.cmd](a)
 
 
 if __name__ == "__main__":
