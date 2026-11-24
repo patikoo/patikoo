@@ -5,3 +5,5 @@ __pycache__/
 # Tracker data holds your location and research; kept local unless you choose to commit it
 /Vending Scout/*
 !/Vending Scout/README.md
+# Packaged download of the tool + private tracker data
+vending-scout.zip
